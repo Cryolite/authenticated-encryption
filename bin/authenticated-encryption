@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+
+import secrets
+import logging
+from typing import (BinaryIO,)
+import sys
+from Crypto.Cipher import (AES,)
+from Crypto.Hash import (SHA512, HMAC)
+from authenticated_encryption import (ProgramOptions, setup_logging, KeyDerivation)
+
+
+_BLOCK_SIZE = 16
+_DIGEST_SIZE = 64
+
+
+def encrypt_main(input_buffer: BinaryIO, output_buffer: BinaryIO,
+                 options: ProgramOptions) -> None:
+    key_derivation = KeyDerivation(options)
+    encryption_key = key_derivation.encryption_key
+    hmac_key = key_derivation.hmac_key
+
+    iv = secrets.token_bytes(_BLOCK_SIZE)
+    output_buffer.write(iv)
+    cipher = AES.new(key=encryption_key, mode=AES.MODE_CBC, IV=iv)
+    hmac = HMAC.new(key=hmac_key, msg=iv, digestmod=SHA512)
+
+    plaintext = bytearray()
+    while True:
+        tmp = input_buffer.read1()
+        if len(tmp) == 0:
+            break
+        plaintext += tmp
+        if len(plaintext) < _BLOCK_SIZE:
+            continue
+
+        encryption_size = (len(plaintext) // _BLOCK_SIZE) * _BLOCK_SIZE
+        ciphertext = cipher.encrypt(bytes(plaintext[:encryption_size]))
+        plaintext = plaintext[encryption_size:]
+        hmac.update(ciphertext)
+        output_buffer.write(ciphertext)
+
+    padding = _BLOCK_SIZE - len(plaintext)
+    plaintext += padding.to_bytes(1, byteorder='little') * padding
+    ciphertext = cipher.encrypt(bytes(plaintext))
+    hmac.update(ciphertext)
+    output_buffer.write(ciphertext)
+    output_buffer.write(hmac.digest())
+    output_buffer.flush()
+
+
+def decrypt_main(input_buffer: BinaryIO, output_buffer: BinaryIO,
+                 options: ProgramOptions) -> None:
+    key_derivation = KeyDerivation(options)
+    encryption_key = key_derivation.encryption_key
+    hmac_key = key_derivation.hmac_key
+
+    iv = input_buffer.read(_BLOCK_SIZE)
+    if len(iv) != _BLOCK_SIZE:
+        raise RuntimeError(
+            'The length of the ciphertext is less than the block size.')
+
+    hmac = HMAC.new(key=hmac_key, msg=iv, digestmod=SHA512)
+    cipher = AES.new(key=encryption_key, mode=AES.MODE_CBC, IV=iv)
+
+    ciphertext = bytearray()
+    while True:
+        tmp = input_buffer.read1()
+        if len(tmp) == 0:
+            break
+        ciphertext += tmp
+        if len(ciphertext) < _BLOCK_SIZE * 2 + _DIGEST_SIZE:
+            continue
+
+        decryption_size = ((len(ciphertext) - _BLOCK_SIZE - _DIGEST_SIZE) // _BLOCK_SIZE) * _BLOCK_SIZE
+        hmac.update(ciphertext[:decryption_size])
+        plaintext = cipher.decrypt(bytes(ciphertext[:decryption_size]))
+        ciphertext = ciphertext[decryption_size:]
+        output_buffer.write(plaintext)
+
+    if len(ciphertext) < _BLOCK_SIZE - _DIGEST_SIZE:
+        raise RuntimeError('The length of ciphertext is not equal to a\
+ multiple of the block size plus digest size.')
+    digest = ciphertext[-_DIGEST_SIZE:]
+    ciphertext = ciphertext[:-_DIGEST_SIZE]
+    if len(ciphertext) != _BLOCK_SIZE:
+        raise RuntimeError('The length of ciphertext is not equal to a\
+ multiple of the block size plus digest size.')
+    hmac.update(ciphertext)
+    plaintext = cipher.decrypt(bytes(ciphertext))
+
+    if hmac.digest() != digest:
+        raise RuntimeError(f'''Failed to verify authentication because the\
+ digest differs from the expected one!
+Calculated digest: {hmac.hexdigest()}
+Expected digest: {digest}''')
+
+    padding = plaintext[-1]
+    if padding > _BLOCK_SIZE:
+        raise RuntimeError('Invalid padding in the ciphertext.')
+    if plaintext[-padding:] != padding.to_bytes(1, 'little') * padding:
+        raise RuntimeError('Invalid padding in the ciphertext.')
+    plaintext = plaintext[:-padding]
+    output_buffer.write(plaintext)
+    output_buffer.flush()
+
+
+if __name__ == '__main__':
+    try:
+        options = ProgramOptions()
+    except Exception as e:
+        logging.exception('Abort due to an exception.')
+        sys.exit(1)
+
+    if options.verbosity == 0:
+        setup_logging(logging.WARNING)
+    elif options.verbosity == 1:
+        setup_logging(logging.INFO)
+    else:
+        assert(options.verbosity >= 2)
+        setup_logging(logging.DEBUG)
+
+    if options.mode == 'encryption':
+        if options.input_file_path is None:
+            if options.output_file_path is None:
+                encrypt_main(input_buffer=sys.stdin.buffer,
+                             output_buffer=sys.stdout.buffer, options=options)
+            else:
+                with open(options.output_file_path, 'xb') as output_file:
+                    encrypt_main(input_buffer=sys.stdin.buffer,
+                                 output_buffer=output_file, options=options)
+        else:
+            with open(options.input_file_path, 'rb') as input_file:
+                if options.output_file_path is None:
+                    encrypt_main(input_buffer=input_file,
+                                 output_buffer=sys.stdout.buffer,
+                                 options=options)
+                else:
+                    with open(options.output_file_path, 'xb') as output_file:
+                        encrypt_main(input_buffer=input_file,
+                                     output_buffer=output_file,
+                                     options=options)
+    else:
+        assert(options.mode == 'decryption')
+        if options.input_file_path is None:
+            if options.output_file_path is None:
+                decrypt_main(input_buffer=sys.stdin.buffer,
+                             output_buffer=sys.stdout.buffer, options=options)
+            else:
+                with open(options.output_file_path, 'xb') as output_file:
+                    decrypt_main(input_buffer=sys.stdin.buffer,
+                                 output_buffer=output_file, options=options)
+        else:
+            with open(options.input_file_path, 'rb') as input_file:
+                if options.output_file_path is None:
+                    decrypt_main(input_buffer=input_file,
+                                 output_buffer=sys.stdout.buffer,
+                                 options=options)
+                else:
+                    with open(options.output_file_path, 'xb') as output_file:
+                        decrypt_main(input_buffer=input_file,
+                                     output_buffer=output_file,
+                                     options=options)

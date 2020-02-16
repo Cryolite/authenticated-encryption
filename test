@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+
+tempdir="$(mktemp -d)"
+trap "rm -rf '$tempdir'" EXIT
+
+echo 'password' >"$tempdir/password"
+
+for (( i = 0; i < 1000000; ++i )); do
+  head -c "$i" /dev/urandom | LANG=C.UTF-8 tr -dc '[:graph:]' >"$tempdir/input_file"
+  size=$(wc -c "$tempdir/input_file" | cut -d ' ' -f 1)
+  authenticated-encryption encrypt \
+                           -p "file:$tempdir/password" \
+                           --key-derivation-iteration 0 \
+                           -i "$tempdir/input_file" \
+    | authenticated-encryption decrypt \
+                               -p "file:$tempdir/password" \
+                               --key-derivation-iteration 0 \
+                               -o "$tempdir/output_file"
+  if diff -q "$tempdir/input_file" "$tempdir/output_file"; then
+    echo "$i: Success (size = $size)."
+  else
+    echo "$i: Fail (size = $size)." >&2
+    exit 1
+  fi
+  rm -f "$tempdir/input_file" "$tempdir/output_file"
+done
